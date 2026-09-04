@@ -1,12 +1,13 @@
 --!nonstrict
--- CloverHub bootstrap: key injection, cached fetch, Delta-safe HTTP, optional FPS sweep
+-- SyncHub bootstrap: key injection, cached fetch, Delta-safe HTTP, optional FPS sweep
+-- This wrapper is yours. The hub it loads is CloverHub and still identifies itself as such.
 
 local ENV = (typeof(getgenv) == "function" and getgenv()) or _G
 
 ----------------------------------------------------------------- config
 local KEY        = "CH-8FA82EA2-366D4DB1-A085FF0E-CE75D5C2"
 local LOADER_URL = "https://cloverhub.app/clover.lua"
-local CACHE_DIR  = "CloverHub"
+local CACHE_DIR  = "SyncHub"
 local CACHE_TTL  = 6 * 60 * 60   -- seconds of source reuse; 0 = always download
 local FPS_SWEEP  = true          -- client-side render cleanup
 local FPS_CAP    = 60            -- 0 = leave alone
@@ -15,11 +16,12 @@ local FPS_CAP    = 60            -- 0 = leave alone
 local SRC_FILE, META_FILE = CACHE_DIR .. "/loader.lua", CACHE_DIR .. "/loader.stamp"
 
 local function log(fmt, ...)
-    warn(string.format("[clover] " .. fmt, ...))
+    warn(string.format("[sync] " .. fmt, ...))
 end
 
 -- Key injection. Hubs disagree on the global name; keep the one CloverHub
--- documents and delete the rest.
+-- documents and delete the rest. These names are CloverHub's interface, not
+-- ours: renaming them breaks the key handoff, so they stay as they are.
 for _, name in { "Key", "key", "script_key", "CloverKey" } do
     ENV[name] = KEY
 end
@@ -131,10 +133,10 @@ local function fpsSweep()
 end
 
 -------------------------------------------------------------------- main
-if ENV.__cloverBootstrap then
+if ENV.__syncBootstrap then
     return log("already running; ignoring duplicate execution")
 end
-ENV.__cloverBootstrap = true
+ENV.__syncBootstrap = true
 
 if not game:IsLoaded() then game.Loaded:Wait() end
 
@@ -143,13 +145,13 @@ if not source then
     source, err = download()
 end
 if not source then
-    ENV.__cloverBootstrap = nil
+    ENV.__syncBootstrap = nil
     return log("download failed: %s", tostring(err))
 end
 
-local chunk, compileError = loadstring(source, "@clover")
+local chunk, compileError = loadstring(source, "@synchub")
 if not chunk then
-    ENV.__cloverBootstrap = nil
+    ENV.__syncBootstrap = nil
     return log("compile failed: %s", tostring(compileError))
 end
 
