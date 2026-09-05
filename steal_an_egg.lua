@@ -1,4 +1,4 @@
---!nonstrict
+﻿--!nonstrict
 --[[
     steal_an_egg.lua - SyncHub feature set for Steal an Egg.
 
@@ -79,6 +79,7 @@ local AREAS = {
 }
 local PRIORITIES = { "Rarity", "KG", "Nearest", "Value" }
 local KG_MODES   = { "Any", "Above", "Below" }
+local MOVE_MODES = { "Walk", "Glide", "Teleport" }
 local ACTIONS    = {
     "Steal", "Place", "Hatch", "CollectCash", "OpenChest", "SkipChest",
     "SellPet", "SellEgg", "EquipBest", "UpgradePen", "Treadmill",
@@ -116,6 +117,38 @@ local function elapsed()
     local seconds = os.time() - State.session
     return string.format("%02d:%02d:%02d",
         seconds // 3600, (seconds % 3600) // 60, seconds % 60)
+end
+
+--=========================================================================--
+--                                JOURNAL                                  --
+--=========================================================================--
+-- A kick tears down the Lua VM and takes any in-memory log with it, so every
+-- notable action is appended to disk the moment it happens. After a kick, open
+-- SyncHub/journal.txt: the last line is what the hub did immediately before.
+local Journal = {}
+
+function Journal:write(fmt, ...)
+    local ok, body = pcall(string.format, fmt, ...)
+    local line = string.format("[%s] %s", os.date("%H:%M:%S"),
+        ok and body or tostring(fmt))
+
+    if appendfile then
+        pcall(appendfile, DIR .. "/journal.txt", line .. "\n")
+    elseif hasFS and writefile then
+        State.journalBuffer = (State.journalBuffer or "") .. line .. "\n"
+        pcall(writefile, DIR .. "/journal.txt", State.journalBuffer)
+    end
+end
+
+function Journal:reset()
+    local header = string.format(
+        "=== session %s | place %d | job %s | executor %s ===\n",
+        os.date("%Y-%m-%d %H:%M:%S"), game.PlaceId, game.JobId,
+        (identifyexecutor and identifyexecutor()) or "unknown")
+    State.journalBuffer = header
+    if hasFS and writefile then
+        pcall(writefile, DIR .. "/journal.txt", header)
+    end
 end
 
 --=========================================================================--
@@ -212,9 +245,14 @@ function Adapter:invoke(action, ...)
     end
 
     local method = binding.method == "InvokeServer" and "InvokeServer" or "FireServer"
+    Journal:write("invoke %s -> %s:%s (%d args)", action, binding.remote,
+        method, #args)
     local ok, result = pcall(function()
         return remote[method](remote, table.unpack(args))
     end)
+    if not ok then
+        Journal:write("invoke %s FAILED: %s", action, tostring(result))
+    end
     return ok, result
 end
 
@@ -477,28 +515,61 @@ function Features.infiniteJump(on)
     end
 end
 
--- Straight-line CFrame move. Stepping in chunks rather than one teleport keeps
--- most naive server-side distance checks happy.
-function Features.moveTo(position, speed)
+-- Three ways to reach a target, in ascending order of how obvious each is to a
+-- server-side check:
+--   Walk     - Humanoid:MoveTo. Real pathing, real physics, nothing to detect.
+--   Glide    - small per-frame CFrame nudges, hard capped so no single step
+--              exceeds what a fast legitimate player covers in one frame.
+--   Teleport - one jump straight to the target. Fastest and loudest.
+-- Walk is the default on purpose. Teleport at 900+ studs/sec is the single most
+-- reliable way to get kicked from a game like this.
+local ARRIVE   = 7    -- studs; close enough to interact
+local MAX_STEP = 18   -- studs per frame ceiling in Glide mode
+
+function Features.moveTo(position, speed, mode)
     local part = root()
     if not part then return false end
-    speed = math.max(tonumber(speed) or 200, 20)
 
-    local hum = humanoid()
-    if hum then hum.PlatformStand = true end
+    mode  = mode or win:Get("StealMode", "Walk")
+    speed = math.max(tonumber(speed) or 120, 16)
+    local deadline = os.clock() + (tonumber(win:Get("MoveTimeout", 20)) or 20)
+    local distance = (position - part.Position).Magnitude
 
-    while true do
-        part = root()
-        if not part then break end
-        local offset = position - part.Position
-        local distance = offset.Magnitude
-        if distance < 6 then break end
-        local step = math.min(distance, speed * RunService.Heartbeat:Wait())
-        part.CFrame = CFrame.new(part.Position + offset.Unit * step, position)
+    if mode == "Teleport" then
+        Journal:write("teleport %.0f studs", distance)
+        part.CFrame = CFrame.new(position + Vector3.new(0, 3, 0))
+            * (part.CFrame - part.Position)
+        return true
     end
 
-    if hum then hum.PlatformStand = false end
-    return true
+    if mode == "Walk" then
+        local hum = humanoid()
+        if not hum then return false end
+        Journal:write("walk %.0f studs", distance)
+        while os.clock() < deadline do
+            part = root()
+            if not part then return false end
+            if (position - part.Position).Magnitude < ARRIVE then return true end
+            hum:MoveTo(position)   -- re-issued because MoveTo gives up after 8s
+            task.wait(0.25)
+        end
+        Journal:write("walk timed out")
+        return false
+    end
+
+    Journal:write("glide %.0f studs at %d", distance, speed)
+    while os.clock() < deadline do
+        part = root()
+        if not part then return false end
+        local offset = position - part.Position
+        if offset.Magnitude < ARRIVE then return true end
+        local dt = RunService.Heartbeat:Wait()
+        local step = math.min(offset.Magnitude, speed * dt, MAX_STEP)
+        local rotation = part.CFrame - part.Position
+        part.CFrame = CFrame.new(part.Position + offset.Unit * step) * rotation
+    end
+    Journal:write("glide timed out")
+    return false
 end
 
 ---------------------------------------------------------------- performance
@@ -777,7 +848,23 @@ function Features.webhook(title, description, colour)
 end
 
 --------------------------------------------------------------------- server
+-- A teleport tears down the Lua VM, so the hub dies on rejoin and on every
+-- server hop unless the executor is told to run it again on the other side.
+local RELOAD = 'loadstring(game:HttpGet("' .. REPO .. 'sae.lua"))()'
+
+local function persistThroughTeleport()
+    local queue = ENV.queue_on_teleport or queue_on_teleport
+    if not queue then
+        win:Notify("executor has no queue_on_teleport - reload manually "
+            .. "after the hop", "warn", 6)
+        return false
+    end
+    local ok = pcall(queue, RELOAD)
+    return ok
+end
+
 function Features.rejoin()
+    persistThroughTeleport()
     if #Players:GetPlayers() <= 1 then
         pcall(function() TeleportService:Teleport(game.PlaceId, lp()) end)
     else
@@ -803,6 +890,7 @@ function Features.serverHop()
     for _, server in payload.data do
         if server.id ~= game.JobId and server.playing < server.maxPlayers then
             win:Notify("hopping...", "warn")
+            persistThroughTeleport()
             local sent = pcall(function()
                 TeleportService:TeleportToPlaceInstance(game.PlaceId, server.id, lp())
             end)
@@ -882,7 +970,7 @@ function Features.stealOnce()
     local target = pivotOf(best.instance)
     if not target then return false end
 
-    Features.moveTo(target, win:Get("StealSpeed", 960))
+    Features.moveTo(target, win:Get("StealSpeed", 120))
     local ok = Adapter:invoke("Steal", best.instance)
 
     if ok then
@@ -896,7 +984,7 @@ function Features.stealOnce()
         end
     end
 
-    if home then Features.moveTo(home, win:Get("StealSpeed", 960)) end
+    if home then Features.moveTo(home, win:Get("StealSpeed", 120)) end
     return ok
 end
 
@@ -984,8 +1072,13 @@ do
     steal:Toggle("AutoSteal", "Auto steal", false)
     steal:Toggle("PersistentSteal", "Retry on failure", true)
     steal:Toggle("PreventTraps", "Avoid traps and guards", true)
-    steal:Slider("StealSpeed", "Travel speed", 100, 1500, 960, 10)
-    steal:Slider("StealDelay", "Delay between steals", 0.2, 10, 1, 0.1)
+    steal:Dropdown("StealMode", "Travel mode", MOVE_MODES, "Walk")
+    steal:Label("Walk is real movement and cannot be detected. Glide is "
+        .. "capped per frame. Teleport is fast and the most likely to get "
+        .. "you kicked.")
+    steal:Slider("StealSpeed", "Glide speed", 40, 400, 120, 10)
+    steal:Slider("StealDelay", "Delay between steals", 0.5, 15, 3, 0.5)
+    steal:Slider("MoveTimeout", "Give up after", 5, 60, 20, 1)
     steal:Button("Steal once (test)", function()
         local ok = Features.stealOnce()
         win:Notify(ok and "steal fired" or "no valid target", ok and "ok" or "warn")
@@ -1147,10 +1240,12 @@ end
 -------------------------------------------------------------------- settings
 do
     local movement = tabSettings:Group("Movement")
-    movement:Slider("WalkSpeed", "Walk speed", 16, 350, 16, 1, Features.applyCharacter)
-    movement:Slider("JumpPower", "Jump power", 50, 250, 50, 5, Features.applyCharacter)
+    movement:Slider("WalkSpeed", "Walk speed", 16, 120, 16, 1, Features.applyCharacter)
+    movement:Slider("JumpPower", "Jump power", 50, 150, 50, 5, Features.applyCharacter)
     movement:Toggle("Noclip", "Noclip", false, Features.noclip)
     movement:Toggle("InfiniteJump", "Infinite jump", false, Features.infiniteJump)
+    movement:Label("Walk speed above about 40 and noclip are what simple "
+        .. "anti-cheats look for. Raise them a little at a time.")
 
     local perf = tabSettings:Group("Performance")
     perf:Toggle("ExtremeFPS", "Extreme FPS mode", false, function(on)
@@ -1224,8 +1319,14 @@ end
 --=========================================================================--
 local found = Adapter:scan()
 
+Journal:reset()
+Journal:write("boot: %d remotes, hook=%s, queue_on_teleport=%s",
+    found, tostring(hookmetamethod ~= nil),
+    tostring((ENV.queue_on_teleport or queue_on_teleport) ~= nil))
+
 win:Track(lp().CharacterAdded:Connect(function()
     task.wait(0.6)
+    Journal:write("respawn")
     Features.applyCharacter()
     if State.noclip then Features.noclip(true) end
 end))
